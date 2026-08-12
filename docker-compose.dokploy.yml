@@ -1,30 +1,37 @@
-# Override for Dokploy deployments. Use alongside docker-compose.yml:
-#   docker compose -f docker-compose.yml -f docker-compose.dokploy.yml up -d
+# Standalone compose file for Dokploy deployments.
+# Point Dokploy to this file instead of docker-compose.yml.
 #
-# In Dokploy UI:
-#   - Compose file:          docker-compose.yml
-#   - Compose override file: docker-compose.dokploy.yml
-#   - Environment variable:  WGER_DOMAIN=your-domain.com
+# Traefik handles all external routing:
+#   Host(WGER_DOMAIN)/         → web:8000  (Django app)
+#   Host(WGER_DOMAIN)/ps/      → powersync:8080  (strips /ps prefix)
+#   Host(WGER_DOMAIN)/static/  → nginx:80  (files from volume)
+#   Host(WGER_DOMAIN)/media/   → nginx:80  (files from volume)
 #
-# Also update config/dokploy.env with your domain before deploying.
+# Before deploying:
+#   1. Set WGER_DOMAIN in Dokploy's environment variables.
+#   2. Edit config/dokploy.env and set SITE_URL to your domain.
 
 services:
   web:
+    image: docker.io/wger/server:latest
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: 3
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
     env_file:
+      - ./config/prod.env
       - ./config/dokploy.env
-
-  celery_worker:
-    env_file:
-      - ./config/dokploy.env
-
-  celery_beat:
-    env_file:
-      - ./config/dokploy.env
-
-  nginx:
-    ports: !reset []
+    volumes:
+      - static:/home/wger/static
+      - media:/home/wger/media
     expose:
-      - 80
+      - 8000
     networks:
       - default
       - dokploy-network
@@ -33,9 +40,144 @@ services:
       - "traefik.http.routers.wger.rule=Host(`${WGER_DOMAIN}`)"
       - "traefik.http.routers.wger.entrypoints=websecure"
       - "traefik.http.routers.wger.tls.certResolver=letsencrypt"
-      - "traefik.http.services.wger.loadbalancer.server.port=80"
+      - "traefik.http.routers.wger.priority=1"
+      - "traefik.http.services.wger.loadbalancer.server.port=8000"
+      - "traefik.docker.network=dokploy-network"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000"]
+      interval: 10s
+      timeout: 5s
+      start_period: 300s
+      retries: 5
+    restart: unless-stopped
+
+  powersync:
+    depends_on:
+      db:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    networks:
+      - default
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.wger-ps.rule=Host(`${WGER_DOMAIN}`) && PathPrefix(`/ps/`)"
+      - "traefik.http.routers.wger-ps.entrypoints=websecure"
+      - "traefik.http.routers.wger-ps.tls.certResolver=letsencrypt"
+      - "traefik.http.routers.wger-ps.priority=10"
+      - "traefik.http.middlewares.wger-ps-strip.stripprefix.prefixes=/ps"
+      - "traefik.http.routers.wger-ps.middlewares=wger-ps-strip"
+      - "traefik.http.services.wger-ps.loadbalancer.server.port=8080"
       - "traefik.docker.network=dokploy-network"
 
+  # Serves only /static/ and /media/ from volumes.
+  # Traefik handles all other routing directly to web and powersync.
+  nginx:
+    image: docker.io/nginx:stable
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: 3
+    depends_on:
+      web:
+        condition: service_healthy
+    volumes:
+      - ./config/nginx-static.conf:/etc/nginx/conf.d/default.conf
+      - static:/wger/static:ro
+      - media:/wger/media:ro
+    expose:
+      - 80
+    networks:
+      - default
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.wger-static.rule=Host(`${WGER_DOMAIN}`) && (PathPrefix(`/static/`) || PathPrefix(`/media/`))"
+      - "traefik.http.routers.wger-static.entrypoints=websecure"
+      - "traefik.http.routers.wger-static.tls.certResolver=letsencrypt"
+      - "traefik.http.routers.wger-static.priority=20"
+      - "traefik.http.services.wger-static.loadbalancer.server.port=80"
+      - "traefik.docker.network=dokploy-network"
+    healthcheck:
+      test: ["CMD", "service", "nginx", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  db:
+    shm_size: 256mb
+    environment:
+      - TZ=Europe/Berlin
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: 5
+
+  cache:
+    volumes:
+      - redis-data:/data
+
+  celery_worker:
+    image: docker.io/wger/server:latest
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: 3
+    command: /start-worker
+    env_file:
+      - ./config/prod.env
+      - ./config/dokploy.env
+    volumes:
+      - media:/home/wger/media
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "celery", "-A", "wger", "inspect", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  celery_beat:
+    image: docker.io/wger/server:latest
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: 3
+    command: /start-beat
+    volumes:
+      - celery-beat:/home/wger/beat/
+    env_file:
+      - ./config/prod.env
+      - ./config/dokploy.env
+    depends_on:
+      celery_worker:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  celery-beat:
+  redis-data:
+  media:
+  static:
+
 networks:
+  default:
+    name: wger_network
   dokploy-network:
     external: true
+
+include:
+  - path: ./services/postgres.yaml
+  - path: ./services/powersync.yaml
+  - path: ./services/redis.yaml
