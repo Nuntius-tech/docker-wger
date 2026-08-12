@@ -1,0 +1,41 @@
+# Override for Dokploy deployments. Use alongside docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.dokploy.yml up -d
+#
+# In Dokploy UI:
+#   - Compose file:          docker-compose.yml
+#   - Compose override file: docker-compose.dokploy.yml
+#   - Environment variable:  WGER_DOMAIN=your-domain.com
+#
+# Also update config/dokploy.env with your domain before deploying.
+
+services:
+  web:
+    env_file:
+      - ./config/dokploy.env
+
+  celery_worker:
+    env_file:
+      - ./config/dokploy.env
+
+  celery_beat:
+    env_file:
+      - ./config/dokploy.env
+
+  nginx:
+    ports: !reset []
+    expose:
+      - 80
+    networks:
+      - default
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.wger.rule=Host(`${WGER_DOMAIN}`)"
+      - "traefik.http.routers.wger.entrypoints=websecure"
+      - "traefik.http.routers.wger.tls.certResolver=letsencrypt"
+      - "traefik.http.services.wger.loadbalancer.server.port=80"
+      - "traefik.docker.network=dokploy-network"
+
+networks:
+  dokploy-network:
+    external: true
